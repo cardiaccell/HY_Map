@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>한양대학교 캠퍼스 맵 (v15.7 - 길이기반 혼잡 구간 표시)</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin/>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:ui-sans-serif,system-ui,-apple-system,"Noto Sans KR",sans-serif;background:#f9fafb;display:flex;flex-direction:column;align-items:center;height:100vh}
+    header{width:100%;max-width:1000px;padding:16px;display:flex;justify-content:center;gap:8px;background:#fff;border-bottom:1px solid #e5e7eb;position:fixed;top:0;z-index:1000}
+    main{flex:1;display:flex;justify-content:center;align-items:center;width:100%;margin-top:80px;margin-bottom:200px}
+    #map{height:70vh;width:100%;max-width:1000px;border-radius:12px;box-shadow:0 2px 6px rgba(0,0,0,.1)}
+    footer{position:fixed;bottom:0;background:#fff;border-top:1px solid #e5e7eb;width:100%;max-width:1000px;padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    input,button{padding:10px 14px;border-radius:8px;border:1px solid #d1d5db;font-size:14px}
+    button.primary{background:#2563eb;color:#fff;border:none;cursor:pointer}
+    button.ghost{background:#fff;color:#111827;border:1px solid #d1d5db;cursor:pointer}
+    .card{border-radius:8px;padding:10px;background:#fff;cursor:pointer}
+    .card-title{font-weight:700;margin-bottom:6px;font-size:15px;display:flex;justify-content:space-between;align-items:center}
+    .pill{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid #e5e7eb}
+    .photo{width:260px;height:150px;background:#f3f4f6;border-radius:10px;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:12px}
+    .muted{color:#6b7280;font-size:12px}
+    .blue{border:2px solid #2563eb}
+    .green{border:2px solid #16a34a}
+    .selected{box-shadow:0 0 0 2px #111827 inset}
+  </style>
+</head>
+<body>
+  <header>
+    <input id="srcInput" type="text" placeholder="출발지 입력 (지도 클릭 가능)" style="width:38%"/>
+    <input id="dstInput" type="text" placeholder="도착지 입력 (지도 클릭 가능)" style="width:38%"/>
+    <button id="btnSearch" class="primary">경로 탐색</button>
+    <button id="btnClear" class="ghost">초기화</button>
+  </header>
+
+  <main><div id="map"></div></main>
+
+  <footer>
+    <div id="leftCard" class="card blue"></div>
+    <div id="rightCard" class="card green"></div>
+  </footer>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const CAMPUS_CENTER={lat:37.5577,lng:127.0456};
+    const map=L.map('map').setView([CAMPUS_CENTER.lat,CAMPUS_CENTER.lng],16);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:20}).addTo(map);
+
+    let routeLayers=[];
+    let userMarker=null,userCircle=null;
+    let source=null,target=null;
+    let selectedMode='fast';
+    let lastRoute=null; // {coords, dist, duration, profile, colors}
+
+    const congestionCache=new Map();
+    function rand(min,max){return Math.floor(Math.random()*(max-min+1))+min;}
+    function ensureCongestion(label){if(!congestionCache.has(label))congestionCache.set(label,rand(10,90));return congestionCache.get(label);}
+    function accessLabel(v){return v<40?'양호':v<70?'보통':'혼잡';}
+    function fmtDistance(m){return m<1000?`${Math.round(m)} m`:`${(m/1000).toFixed(2)} km`;}
+    function fmtDuration(sec){const m=Math.round(sec/60);return m<=1?`약 1분`:`${m}분`;}
+
+    async function labelFromReverse(lat,lng){
+      try{
+        const r=await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=jsonv2&zoom=18&accept-language=ko`);
+        const j=await r.json(); return j.name||j.display_name.split(',')[0]||'장소';
+      }catch{ return '장소';}
+    }
+
+    function openPopup(lat,lng,label){
+      const c=ensureCongestion(label);
+      const access=accessLabel(c);
+      const border=c<40?'#16a34a':c<70?'#facc15':'#dc2626';
+      const html=`
+        <div style="font-size:13px;border:2px solid ${border};border-radius:10px;padding:8px;">
+          <div class="photo">사진 없음</div>
+          <div style="margin-top:8px;font-weight:600">${label}</div>
+          <div class="muted">접근성: ${access}, 혼잡도: ${c}%</div>
+          <div style="display:flex;gap:6px;margin-top:8px">
+            <button class="primary" onclick='window._setSrc(${lat},${lng},"${label}")'>출발</button>
+            <button class="primary" style="background:#16a34a" onclick='window._setDst(${lat},${lng},"${label}")'>도착</button>
+          </div>
+        </div>`;
+      L.popup().setLatLng([lat,lng]).setContent(html).openOn(map);
+    }
+
+    map.on('click',async e=>{
+      const {lat,lng}=e.latlng; const name=await labelFromReverse(lat,lng); openPopup(lat,lng,name);
+    });
+
+    window._setSrc=(lat,lng,label)=>{source={lat,lng,label};document.getElementById('srcInput').value=label;map.closePopup();};
+    window._setDst=(lat,lng,label)=>{target={lat,lng,label};document.getElementById('dstInput').value=label;map.closePopup();};
+
+    async function fetchRoute(){
+      const url=`https://router.project-osrm.org/route/v1/foot/${source.lng},${source.lat};${target.lng},${target.lat}?overview=full&geometries=geojson`;
+      const res=await fetch(url);
+      if(!res.ok) throw new Error('OSRM 응답 오류');
+      const data=await res.json();
+      if(!data.routes||!data.routes.length) throw new Error('경로 없음');
+      const r=data.routes[0];
+      const coords=r.geometry.coordinates.map(([x,y])=>[y,x]);
+      const dist=r.distance;
+      const duration=dist/1.25;
+
+      const profile=buildCongestionProfile(coords);
+      // 길이 기준 상위 20%만 칠함(+ 스무딩)
+      const colors = colorByCoverage(coords, profile, {
+        targetCoverage:0.20,   // 상위 20% 길이만 색칠
+        yellowTh:60,           // 노랑 임계
+        redTh:80,              // 빨강 임계
+        smoothNeighbors:1      // 양옆 1칸 확장(시각적 끊김 방지)
+      });
+
+      return {coords,dist,duration,profile,colors};
+    }
+
+    // 혼잡도 프로파일: 기본 10%, 핫스팟 1~2개(좁게)
+    function buildCongestionProfile(coords){
+      const n=coords.length-1;
+      if(n<=0) return [];
+      const base=10;
+      const profile=new Array(n).fill(base);
+
+      const hotspotCount = rand(1,2);
+      const candidates=[Math.floor(n*0.35), Math.floor(n*0.6), Math.floor(n*0.8)];
+      const picks=[];
+      while(picks.length<hotspotCount && candidates.length){
+        const idx=rand(0,candidates.length-1);
+        picks.push(candidates.splice(idx,1)[0]);
+      }
+      picks.forEach(center=>{
+        const width = Math.max(2, Math.floor(n*0.04)); // 좁은 영향
+        for(let i=Math.max(0,center-width); i<=Math.min(n-1,center+width); i++){
+          const d=Math.abs(i-center);
+          const peak=85 - rand(0,5);
+          const ratio = 1 - d/(width+0.01);
+          const val = Math.max(40, Math.round(peak*ratio));
+          profile[i]=Math.max(profile[i], val);
+        }
+      });
+      for(let i=0;i<n;i++){
+        profile[i]=Math.min(100, Math.max(0, profile[i] + rand(-3,3)));
+      }
+      return profile;
+    }
+
+    // 좌표 → 각 세그먼트 길이(m)
+    function segmentLengths(coords){
+      const out=[];
+      for(let i=0;i<coords.length-1;i++){
+        out.push(haversine(coords[i], coords[i+1]));
+      }
+      return out;
+    }
+    function toRad(d){return d*Math.PI/180;}
+    function haversine(a,b){
+      const R=6371000;
+      const dLat=toRad(b[0]-a[0]), dLng=toRad(b[1]-a[1]);
+      const s=Math.sin(dLat/2)**2 + Math.cos(toRad(a[0]))*Math.cos(toRad(b[0]))*Math.sin(dLng/2)**2;
+      return 2*R*Math.atan2(Math.sqrt(s), Math.sqrt(1-s));
+    }
+
+    // 길이 기반 상위 커버리지 만큼만 색칠 + 스무딩
+    function colorByCoverage(coords, profile, {targetCoverage=0.2, yellowTh=60, redTh=80, smoothNeighbors=1}={}){
+      const n=profile.length;
+      const lens=segmentLengths(coords);
+      const totalLen=lens.reduce((a,b)=>a+b,0);
+
+      // 혼잡 점수 높은 순으로 세그먼트 정렬
+      const idxs=[...Array(n).keys()].sort((a,b)=>profile[b]-profile[a]);
+
+      const chosen=new Array(n).fill(false);
+      let covered=0;
+      for(const i of idxs){
+        if(covered/totalLen >= targetCoverage) break;
+        if(chosen[i]) continue;
+        chosen[i]=true;
+        covered += lens[i];
+      }
+
+      // 스무딩: 양옆 smoothNeighbors만큼 확장(짧은 구간 끊김 방지)
+      if(smoothNeighbors>0){
+        const copy=chosen.slice();
+        for(let i=0;i<n;i++){
+          if(copy[i]){
+            for(let k=1;k<=smoothNeighbors;k++){
+              if(i-k>=0) chosen[i-k]=true;
+              if(i+k<n)  chosen[i+k]=true;
+            }
+          }
+        }
+      }
+
+      // 색상 결정: 선택되지 않은 건 'base'
+      const colors=new Array(n).fill('base');
+      for(let i=0;i<n;i++){
+        if(!chosen[i]) continue;
+        if(profile[i]>=redTh) colors[i]='red';
+        else if(profile[i]>=yellowTh) colors[i]='yellow';
+        else colors[i]='base';
+      }
+      return colors;
+    }
+
+    function clearRouteLayers(){
+      routeLayers.forEach(l=>map.removeLayer(l));
+      routeLayers=[];
+    }
+
+    function drawSelected(){
+      if(!lastRoute) return;
+      clearRouteLayers();
+
+      const baseColor=(selectedMode==='fast')?'#2563eb':'#16a34a';
+      const dash=(selectedMode==='accessible')?'8,6':null;
+
+      const {coords,colors}=lastRoute;
+      for(let i=0;i<coords.length-1;i++){
+        const a=coords[i], b=coords[i+1];
+        let color=baseColor;
+        if(colors[i]==='yellow') color='#facc15';
+        else if(colors[i]==='red') color='#dc2626';
+        const seg=L.polyline([a,b],{
+          color, weight:6, opacity:0.95, dashArray:dash
+        }).addTo(map);
+        routeLayers.push(seg);
+      }
+      map.fitBounds(L.latLngBounds(coords),{padding:[40,40]});
+      paintCards();
+    }
+
+    function paintCards(){
+      const left=document.getElementById('leftCard');
+      const right=document.getElementById('rightCard');
+      left.classList.toggle('selected',selectedMode==='fast');
+      right.classList.toggle('selected',selectedMode==='accessible');
+
+      const srcC=ensureCongestion(source.label), dstC=ensureCongestion(target.label);
+      const srcAccess=accessLabel(srcC), dstAccess=accessLabel(dstC);
+      const info=`
+        <table style="width:100%;font-size:13px;border-collapse:collapse;margin-top:6px;">
+          <tr><td style="width:50%;"><b>출발지:</b> ${source.label}</td><td><b>도착지:</b> ${target.label}</td></tr>
+          <tr><td>접근성: ${srcAccess}　혼잡도: ${srcC}%</td><td>접근성: ${dstAccess}　혼잡도: ${dstC}%</td></tr>
+        </table>`;
+      left.innerHTML=`
+        <div class="card-title"> 최단 시간 경로 <span class="pill">파란색</span></div>
+        <div>예상 소요: ${fmtDuration(lastRoute.duration)} / 거리: ${fmtDistance(lastRoute.dist)}</div>
+        ${info}`;
+      right.innerHTML=`
+        <div class="card-title"> 계단 회피 경로 <span class="pill">초록색</span></div>
+        <div>예상 소요: ${fmtDuration(lastRoute.duration*1.05)} / 거리: ${fmtDistance(lastRoute.dist*1.02)}</div>
+        ${info}`;
+    }
+
+    document.getElementById('btnSearch').addEventListener('click',async()=>{
+      if(!source||!target){alert('출발지와 도착지를 모두 지정하세요.');return;}
+      try{
+        lastRoute=await fetchRoute();
+        selectedMode='fast';
+        drawSelected();
+      }catch(e){alert('경로 탐색 실패');}
+    });
+
+    document.getElementById('btnClear').addEventListener('click',()=>{
+      clearRouteLayers();
+      lastRoute=null; source=target=null;
+      document.getElementById('srcInput').value='';document.getElementById('dstInput').value='';
+      document.getElementById('leftCard').innerHTML='';document.getElementById('rightCard').innerHTML='';
+    });
+
+    document.getElementById('leftCard').addEventListener('click',()=>{ if(lastRoute){selectedMode='fast'; drawSelected();}});
+    document.getElementById('rightCard').addEventListener('click',()=>{ if(lastRoute){selectedMode='accessible'; drawSelected();}});
+
+    // 현재 위치 표시
+    if(navigator.geolocation){
+      navigator.geolocation.watchPosition(pos=>{
+        const {latitude,longitude,accuracy}=pos.coords;
+        const latlng=[latitude,longitude];
+        if(!userMarker){
+          userMarker=L.marker(latlng,{title:"현재 위치"}).addTo(map);
+          userCircle=L.circle(latlng,{radius:accuracy,color:"#2563eb",fillColor:"#3b82f6",fillOpacity:0.2}).addTo(map);
+        }else{
+          userMarker.setLatLng(latlng);
+          userCircle.setLatLng(latlng).setRadius(accuracy);
+        }
+      },err=>{ console.warn("위치 권한 거부/오류",err); },{enableHighAccuracy:true});
+    }else{
+      alert("이 브라우저는 위치 기능을 지원하지 않습니다.");
+    }
+  </script>
+</body>
+</html>
